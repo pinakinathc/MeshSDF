@@ -8,6 +8,9 @@ import os
 import json
 import pdb
 import numpy as np
+import tqdm
+import wandb
+wandb.init(project="SDFAutoEncoder")
 
 import lib
 import lib.workspace as ws
@@ -76,7 +79,7 @@ def main_function(experiment_directory, continue_from):
     train_split_file = specs["TrainSplit"]
     test_split_file = specs["TestSplit"]
 
-    arch_encoder = __import__("lib.models." + specs["NetworkEncoder"], fromlist=["ResNet"])
+    arch_encoder = __import__("lib.models." + specs["NetworkEncoder"], fromlist=["PointNetEncoder"])
     arch_decoder = __import__("lib.models." + specs["NetworkDecoder"], fromlist=["DeepSDF"])
     latent_size = specs["CodeLength"]
 
@@ -126,7 +129,7 @@ def main_function(experiment_directory, continue_from):
     do_code_regularization = get_spec_with_default(specs, "CodeRegularization", True)
     code_reg_lambda = get_spec_with_default(specs, "CodeRegularizationLambda", 1e-4)
 
-    encoder = arch_encoder.ResNet(latent_size, specs["Depth"], norm_type = specs["NormType"]).cuda()
+    encoder = arch_encoder.PointNetEncoder(k=latent_size).cuda()
     decoder = arch_decoder.DeepSDF(latent_size, **specs["NetworkSpecs"]).cuda()
 
     print(encoder)
@@ -138,7 +141,7 @@ def main_function(experiment_directory, continue_from):
     decoder = torch.nn.DataParallel(decoder)
 
     num_epochs = specs["NumEpochs"]
-    log_frequency = get_spec_with_default(specs, "LogFrequency", 1)
+    log_frequency = get_spec_with_default(specs, "LogFrequency", 17)
 
     with open(train_split_file, "r") as f:
         train_split = json.load(f)
@@ -149,10 +152,10 @@ def main_function(experiment_directory, continue_from):
     num_data_loader_threads = get_spec_with_default(specs, "DataLoaderThreads", 16)
     print("loading data with {} threads".format(num_data_loader_threads))
 
-    sdf_dataset = lib.data.RGBA2SDF(
+    sdf_dataset = lib.data.SketchSDF(
         data_source, train_split, num_samp_per_scene, is_train=True, num_views = specs["NumberOfViews"]
     )
-    sdf_dataset_test = lib.data.RGBA2SDF(
+    sdf_dataset_test = lib.data.SketchSDF(
         data_source, test_split, num_samp_per_scene, is_train=False, num_views = specs["NumberOfViews"]
     )
 
@@ -179,20 +182,26 @@ def main_function(experiment_directory, continue_from):
 
     optimizer_all = torch.optim.Adam(
         [
-            {
-                "params": decoder.parameters(),
-                "lr": lr_schedules[0].get_learning_rate(0)/10,
-            },
+            # {
+            #     "params": decoder.parameters(),
+            #     "lr": lr_schedules[0].get_learning_rate(0)/10,
+            # },
             {
                 "params": encoder.parameters(),
-                "lr": lr_schedules[0].get_learning_rate(0),
+                "lr": lr_schedules[1].get_learning_rate(0),
             },
         ]
     )
+    print ('lr: ', lr_schedules[1].get_learning_rate(0))
 
     loss_sdf_log = []
     loss_sdf_test_log = []
     start_epoch = 1
+
+    print ('decoder init and freeze')
+    decoder.load_state_dict(torch.load('/vol/research/sketchscene/i3d/MeshSDF/experiments/chairs_sketch/ModelParameters/decoder_init.py')['model_state_dict'])
+    for p in decoder.parameters():
+        p.requires_grad = False
 
     if continue_from is not None:
 
@@ -234,16 +243,24 @@ def main_function(experiment_directory, continue_from):
         )
     )
 
+    wandb.config = {
+        "learning_rate": lr_schedules[1],
+        "epochs": num_epochs,
+        "batch_size": scene_per_batch
+    }
+    wandb.watch([encoder, decoder])
+
     for epoch in range(start_epoch, num_epochs + 1):
 
         print("epoch {}...".format(epoch))
 
-        decoder.train()
+        # decoder.train()
+        decoder.eval()
         encoder.train()
 
         adjust_learning_rate(lr_schedules, optimizer_all, epoch)
 
-        for sdf_data, image, intrinsic, extrinsic, name in sdf_loader:
+        for sdf_data, pointset, name in tqdm.tqdm(sdf_loader):
 
             optimizer_all.zero_grad()
 
@@ -254,7 +271,7 @@ def main_function(experiment_directory, continue_from):
             if enforce_minmax:
                 sdf_gt = torch.clamp(sdf_gt, minT, maxT)
 
-            vecs = encoder(image)
+            vecs = encoder(pointset)
             # DeepSDF branch
             batch_vecs = vecs.view(vecs.shape[0], 1, vecs.shape[1]).repeat(1, xyz.shape[1], 1).reshape(-1, latent_size)
             pred_sdf = decoder(batch_vecs, xyz.reshape(-1, 3))
@@ -282,51 +299,52 @@ def main_function(experiment_directory, continue_from):
 
             optimizer_all.step()
 
-
+            wandb.log({"train loss": batch_loss})
 
         if epoch in checkpoints:
             print ('saving checkpoints')
             save_checkpoints(epoch)
 
-        encoder.eval()
-        decoder.eval()
-
-        for sdf_data, image, intrinsic, extrinsic, name in sdf_loader_test:
-
-            with torch.no_grad():
-                # Process the input data
-                sdf_data.requires_grad = False
-                xyz = sdf_data[:, :, 0:3].cuda()
-                sdf_gt = sdf_data[:, :, 3].reshape(-1,1).cuda()
-                if enforce_minmax:
-                    sdf_gt = torch.clamp(sdf_gt, minT, maxT)
-
-                vecs = encoder(image)
-                # DeepSDF branch
-                batch_vecs = vecs.view(vecs.shape[0], 1, vecs.shape[1]).repeat(1, xyz.shape[1], 1).reshape(-1, latent_size)
-                pred_sdf = decoder(batch_vecs, xyz.reshape(-1, 3))
-
-                if enforce_minmax:
-                    pred_sdf = torch.clamp(pred_sdf, minT, maxT)
-
-                sdf_loss = loss_l1(pred_sdf, sdf_gt.cuda()) / pred_sdf.shape[0]
-
-                if do_code_regularization:
-                    l2_size_loss = torch.sum(torch.norm(batch_vecs, dim=1))
-                    reg_loss = (
-                        code_reg_lambda * min(1, epoch / 100) * l2_size_loss
-                    ) / pred_sdf.shape[0]
-
-                    batch_loss = sdf_loss + reg_loss.cuda()
-                else:
-                    batch_loss = sdf_loss
-
-                loss_sdf_test_log.append(sdf_loss.cpu())
-
         if epoch % log_frequency == 0:
 
+            encoder.eval()
+            decoder.eval()
+
+            for sdf_data, pointset, name in tqdm.tqdm(sdf_loader_test):
+
+                with torch.no_grad():
+                    # Process the input data
+                    sdf_data.requires_grad = False
+                    xyz = sdf_data[:, :, 0:3].cuda()
+                    sdf_gt = sdf_data[:, :, 3].reshape(-1,1).cuda()
+                    if enforce_minmax:
+                        sdf_gt = torch.clamp(sdf_gt, minT, maxT)
+
+                    vecs = encoder(pointset)
+                    # DeepSDF branch
+                    batch_vecs = vecs.view(vecs.shape[0], 1, vecs.shape[1]).repeat(1, xyz.shape[1], 1).reshape(-1, latent_size)
+                    pred_sdf = decoder(batch_vecs, xyz.reshape(-1, 3))
+
+                    if enforce_minmax:
+                        pred_sdf = torch.clamp(pred_sdf, minT, maxT)
+
+                    sdf_loss = loss_l1(pred_sdf, sdf_gt.cuda()) / pred_sdf.shape[0]
+
+                    if do_code_regularization:
+                        l2_size_loss = torch.sum(torch.norm(batch_vecs, dim=1))
+                        reg_loss = (
+                            code_reg_lambda * min(1, epoch / 100) * l2_size_loss
+                        ) / pred_sdf.shape[0]
+
+                        batch_loss = sdf_loss + reg_loss.cuda()
+                    else:
+                        batch_loss = sdf_loss
+
+                    wandb.log({"val loss": batch_loss})
+                    loss_sdf_test_log.append(sdf_loss.cpu())
+
             print ('loss_sdf: {}, loss_sdf_test: {}'.format(
-                loss_sdf_log, loss_sdf_test_log
+                np.mean([item.detach() for item in loss_sdf_log]), np.mean(loss_sdf_test_log)
             ))
 
             save_latest(epoch)
@@ -336,6 +354,8 @@ def main_function(experiment_directory, continue_from):
                 loss_sdf_test_log,
                 epoch,
             )
+            loss_sdf_log = []
+            loss_sdf_test_log = []
 
 
 if __name__ == "__main__":

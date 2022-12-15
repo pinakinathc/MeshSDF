@@ -9,6 +9,7 @@ import os
 import math
 import json
 import pdb
+import tqdm
 
 import lib
 from lib.workspace import *
@@ -141,7 +142,7 @@ def main_function(experiment_directory, resolution):
         decoder.train()
         adjust_learning_rate(lr_schedules, optimizer_all, epoch)
 
-        for sdf_data, indices, names in sdf_loader:
+        for sdf_data, indices, names in tqdm.tqdm(sdf_loader):
             optimizer_all.zero_grad()
 
             sdf_data = sdf_data.reshape(-1, 4)
