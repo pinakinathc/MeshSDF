@@ -10,7 +10,7 @@ import pdb
 import numpy as np
 import tqdm
 import wandb
-wandb.init(project="SDFAutoEncoder")
+wandb.init(project="SDFAutoEncoder_Reg")
 
 import lib
 import lib.workspace as ws
@@ -177,6 +177,7 @@ def main_function(experiment_directory, continue_from):
     print("There are {} training samples".format(len(sdf_dataset)))
     print("There are {} test samples".format(len(sdf_dataset_test)))
 
+    lat_vecs = torch.load('/vol/research/sketchscene/i3d/MeshSDF/experiments/chairs_sketch_reg/LatentCodes/latest.pth')['latent_codes']['weight'].cuda()
 
     loss_l1 = torch.nn.L1Loss(reduction="sum")
 
@@ -272,14 +273,22 @@ def main_function(experiment_directory, continue_from):
                 sdf_gt = torch.clamp(sdf_gt, minT, maxT)
 
             vecs = encoder(pointset)
+
             # DeepSDF branch
             batch_vecs = vecs.view(vecs.shape[0], 1, vecs.shape[1]).repeat(1, xyz.shape[1], 1).reshape(-1, latent_size)
+
+            indices = indices.unsqueeze(-1).repeat(1, xyz.shape[1]).view(-1)
+            gt_batch_vecs = lat_vecs[indices.cuda()]
+            l1_reg_loss = loss_l1(batch_vecs, gt_batch_vecs)
+            wandb.log({'L1_reg_loss': l1_reg_loss})
+
             pred_sdf = decoder(batch_vecs, xyz.reshape(-1, 3))
 
             if enforce_minmax:
                 pred_sdf = torch.clamp(pred_sdf, minT, maxT)
 
             sdf_loss = loss_l1(pred_sdf, sdf_gt.cuda()) / pred_sdf.shape[0]
+            wandb.log({'SDF_loss': sdf_loss})
 
             if do_code_regularization:
                 l2_size_loss = torch.sum(torch.norm(batch_vecs, dim=1))
@@ -289,6 +298,8 @@ def main_function(experiment_directory, continue_from):
                 batch_loss = sdf_loss + reg_loss.cuda()
             else:
                 batch_loss = sdf_loss
+            
+            batch_loss = batch_loss + l1_reg_loss
             batch_loss.backward()
 
             loss_sdf_log.append(sdf_loss.cpu())

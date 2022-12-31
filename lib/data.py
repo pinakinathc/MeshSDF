@@ -106,8 +106,8 @@ class SketchSDF(torch.utils.data.Dataset):
         self.npyfiles =  get_instance_filenames(data_source, split)
 
         # Get point cloud
-        pc_4096 = np.load('/scratch/i3d/pc_4096.npy') # 6778 x 4096 x 3
-        all_files_names = open('/scratch/i3d/all.txt', 'r').read().split('\n')[:-1] # 6778 x 1
+        pc_4096 = np.load('/vol/research/datasets/still/adobe-wang/i3d/shape_pc_4096.npy') # 6778 x 4096 x 3
+        all_files_names = open('/vol/research/datasets/still/adobe-wang/i3d/all.txt', 'r').read().split('\n')[:-1] # 6778 x 1
         self.all_point_set = {}
         for idx in range(len(all_files_names)):
             self.all_point_set[all_files_names[idx]] = pc_4096[idx]
@@ -128,9 +128,9 @@ class SketchSDF(torch.utils.data.Dataset):
             sdf_samples = unpack_sdf_samples(sdf_filename,  self.subsample)
 
             point_set = self.all_point_set[mesh_name] # 4096 x 3
-            point_set = torch.from_numpy(point_set).transpose(1, 0) # 3 x 4096
+            point_set = torch.from_numpy(point_set).transpose(1, 0).type(torch.FloatTensor) # 3 x 4096
 
-            return sdf_samples, point_set, mesh_name
+            return sdf_samples, point_set, mesh_name, idx
 
         except:
             print ('skipping...', mesh_name)

@@ -88,7 +88,8 @@ def main_function(experiment_directory, continue_from,  iterations, marching_cub
     if not os.path.isdir(optimization_meshes_dir):
         os.makedirs(optimization_meshes_dir)
 
-    for sdf_data, pointset, name in sdf_loader_test:
+    all_cd_dist = []
+    for sdf_data, pointset, name, index in sdf_loader_test:
 
         out_name = name[0]
         # store input stuff
@@ -115,6 +116,15 @@ def main_function(experiment_directory, continue_from,  iterations, marching_cub
         # store raw output
         mesh_filename = os.path.join(optimization_meshes_dir, out_name, "predicted.ply")
         lib.mesh.write_verts_faces_to_file(verts, faces, mesh_filename)
+
+        verts = torch.from_numpy(verts).type(torch.FloatTensor)
+        cd_dist = chamfer_distance(pointset.permute(0, 2, 1), verts[torch.randperm(len(verts))[:4096]].unsqueeze(0))[0]
+        print ('CD {}: {}'.format(out_name, cd_dist))
+        all_cd_dist.append(cd_dist)
+
+    all_cd_dist = torch.stack(all_cd_dist)
+    print ('Chamfer Distance -- mean: {}, std: {}, min: {}, max: {}'.format(
+        all_cd_dist.mean(), all_cd_dist.std(), all_cd_dist.min(), all_cd_dist.max()))
 
 
 if __name__ == "__main__":

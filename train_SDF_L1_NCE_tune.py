@@ -10,7 +10,9 @@ import pdb
 import numpy as np
 import tqdm
 import wandb
-wandb.init(project="SDFAutoEncoder")
+# os.environ["WANDB_RESUME"] = "allow"
+os.environ["WANDB_MODE"] = "offline"
+wandb.init(project="SDFAutoEncoder", name="SDF_L1_NCE_finetune")
 
 import lib
 import lib.workspace as ws
@@ -67,6 +69,28 @@ def clip_logs(loss_sdf_log,loss_regl_log,loss_sdf_test_log,loss_regl_test_log, l
         param_mag_log[n] = param_mag_log[n][:epoch]
 
     return (loss_sdf_log,loss_regl_log,loss_sdf_test_log,loss_regl_test_log, lr_log, timing_log, lat_mag_log, param_mag_log)
+
+
+def loss_NCE(query, indices, latent_vecs):
+    '''
+        query: B x 512, latent vecs from Encoder
+        gt_latvecs: B x 512, latent vecs from AutoDecoder
+    '''
+    B = query.shape[0]
+    L = latent_vecs.shape[0]
+    D = query.shape[1]
+
+    all = torch.nn.functional.l1_loss(
+        query.view(B, 1, D).repeat(1, L, 1),
+        latent_vecs.view(1, L, D).repeat(B, 1, 1),
+        reduction='none'
+    ).sum(dim=2) # B x L
+
+    loss = torch.nn.functional.cross_entropy(
+        -all, indices, reduction='sum'
+    )
+
+    return loss
 
 
 def main_function(experiment_directory, continue_from):
@@ -132,9 +156,6 @@ def main_function(experiment_directory, continue_from):
     encoder = arch_encoder.PointNetEncoder(k=latent_size).cuda()
     decoder = arch_decoder.DeepSDF(latent_size, **specs["NetworkSpecs"]).cuda()
 
-    print(encoder)
-    print(decoder)
-
     print("training with {} GPU(s)".format(torch.cuda.device_count()))
 
     encoder = torch.nn.DataParallel(encoder)
@@ -177,88 +198,68 @@ def main_function(experiment_directory, continue_from):
     print("There are {} training samples".format(len(sdf_dataset)))
     print("There are {} test samples".format(len(sdf_dataset_test)))
 
+    lat_vecs = torch.load(experiment_directory+'/LatentCodes/latest.pth')['latent_codes']['weight'].cuda()
 
     loss_l1 = torch.nn.L1Loss(reduction="sum")
 
     optimizer_all = torch.optim.Adam(
         [
-            # {
-            #     "params": decoder.parameters(),
-            #     "lr": lr_schedules[0].get_learning_rate(0)/10,
-            # },
+            {
+                "params": decoder.parameters(),
+                "lr": lr_schedules[0].get_learning_rate(0)/10,
+            },
             {
                 "params": encoder.parameters(),
-                "lr": lr_schedules[0].get_learning_rate(0),
+                "lr": lr_schedules[1].get_learning_rate(0),
             },
         ]
     )
-    print ('lr: ', lr_schedules[1].get_learning_rate(0))
 
     loss_sdf_log = []
     loss_sdf_test_log = []
     start_epoch = 1
 
-    print ('decoder init and freeze')
-    decoder.load_state_dict(torch.load('/vol/research/sketchscene/i3d/MeshSDF/experiments/chairs_sketch/ModelParameters/decoder_init.py')['model_state_dict'])
-    for p in decoder.parameters():
-        p.requires_grad = False
-
     if continue_from is not None:
 
         print('continuing from "{}"'.format(continue_from))
 
+        try:
+            model_epoch = ws.load_model_parameters(experiment_directory, continue_from, encoder, decoder)
 
-        model_epoch = ws.load_model_parameters(
-            experiment_directory, continue_from, encoder, decoder
-        )
+            optimizer_epoch = load_optimizer(experiment_directory, continue_from + ".pth", optimizer_all)
 
-        optimizer_epoch = load_optimizer(
-            experiment_directory, continue_from + ".pth", optimizer_all
-        )
+            loss_sdf_log,loss_sdf_test_log, log_epoch = load_logs(experiment_directory)
+            if not log_epoch == model_epoch:
+                loss_sdf_log,loss_sdf_test_log= clip_logs(loss_sdf_log,loss_sdf_test_log)
 
-        loss_sdf_log,loss_sdf_test_log, log_epoch = load_logs(experiment_directory)
-        if not log_epoch == model_epoch:
-            loss_sdf_log,loss_sdf_test_log= clip_logs(loss_sdf_log,loss_sdf_test_log)
+            if not (model_epoch == optimizer_epoch):
+                raise RuntimeError(
+                    "epoch mismatch: {} vs {} vs {}".format(
+                        model_epoch, optimizer_epoch, log_epoch
+                    ))
+            start_epoch = model_epoch + 1
 
-        if not (model_epoch == optimizer_epoch):
-            raise RuntimeError(
-                "epoch mismatch: {} vs {} vs {} vs {}".format(
-                    model_epoch, optimizer_epoch, lat_epoch, log_epoch
-                )
-            )
-
-        start_epoch = model_epoch + 1
-
+        except:
+            print ('failed to load from continue. Starting from scratch.')
 
     print("starting from epoch {}".format(start_epoch))
-
-    print(
-        "Number of encoder parameters: {}".format(
-            sum(p.data.nelement() for p in encoder.parameters() if p.requires_grad)
-        )
-    )
-    print(
-        "Number of decoder parameters: {}".format(
-            sum(p.data.nelement() for p in decoder.parameters() if p.requires_grad)
-        )
-    )
+    print("Number of encoder parameters: {}".format(sum(p.data.nelement() for p in encoder.parameters() if p.requires_grad)))
+    print("Number of decoder parameters: {}".format(sum(p.data.nelement() for p in decoder.parameters() if p.requires_grad)))
 
     wandb.config = {
         "learning_rate": lr_schedules[1],
         "epochs": num_epochs,
-        "batch_size": scene_per_batch
-    }
+        "batch_size": scene_per_batch}
     wandb.watch([encoder, decoder])
 
     for epoch in range(start_epoch, num_epochs + 1):
 
         print("epoch {}...".format(epoch))
 
-        # decoder.train()
-        decoder.eval()
+        decoder.train()
         encoder.train()
 
-        adjust_learning_rate(lr_schedules, optimizer_all, epoch)
+        # adjust_learning_rate(lr_schedules, optimizer_all, epoch)
 
         for sdf_data, pointset, name, indices in tqdm.tqdm(sdf_loader):
 
@@ -272,8 +273,16 @@ def main_function(experiment_directory, continue_from):
                 sdf_gt = torch.clamp(sdf_gt, minT, maxT)
 
             vecs = encoder(pointset)
+
+            # L1 based NCE Loss
+            nce_reg_loss = loss_NCE(vecs, indices.cuda(), lat_vecs)
+
             # DeepSDF branch
             batch_vecs = vecs.view(vecs.shape[0], 1, vecs.shape[1]).repeat(1, xyz.shape[1], 1).reshape(-1, latent_size)
+
+            gt_batch_vecs = lat_vecs[indices.view(-1).cuda()]
+            l1_reg_loss = loss_l1(vecs, gt_batch_vecs)
+
             pred_sdf = decoder(batch_vecs, xyz.reshape(-1, 3))
 
             if enforce_minmax:
@@ -289,6 +298,8 @@ def main_function(experiment_directory, continue_from):
                 batch_loss = sdf_loss + reg_loss.cuda()
             else:
                 batch_loss = sdf_loss
+            
+            batch_loss = batch_loss + nce_reg_loss + l1_reg_loss
             batch_loss.backward()
 
             loss_sdf_log.append(sdf_loss.cpu())
@@ -299,13 +310,21 @@ def main_function(experiment_directory, continue_from):
 
             optimizer_all.step()
 
-            wandb.log({"train loss": batch_loss})
+        # wandb logging
+        wandb.log({'NCE_loss': nce_reg_loss}, step=epoch)
+        wandb.log({'L1_loss': l1_reg_loss}, step=epoch)
+        wandb.log({'SDF_loss': sdf_loss}, step=epoch)
+        wandb.log({"total train loss": batch_loss}, step=epoch)
+
 
         if epoch in checkpoints:
             print ('saving checkpoints')
             save_checkpoints(epoch)
 
         if epoch % log_frequency == 0:
+
+            print ('Training -- SDF_loss: {}, NCE_loss: {}, L1_loss: {}, total_loss: {}'.format(
+                sdf_loss.item(), nce_reg_loss.item(), l1_reg_loss.item(), batch_loss.item()))
 
             encoder.eval()
             decoder.eval()
@@ -340,12 +359,10 @@ def main_function(experiment_directory, continue_from):
                     else:
                         batch_loss = sdf_loss
 
-                    wandb.log({"val loss": batch_loss})
+                    wandb.log({"val loss": batch_loss}, step=epoch)
                     loss_sdf_test_log.append(sdf_loss.cpu())
 
-            print ('loss_sdf: {}, loss_sdf_test: {}'.format(
-                np.mean([item.detach() for item in loss_sdf_log]), np.mean(loss_sdf_test_log)
-            ))
+            print ('Val Loss: ', batch_loss.item())
 
             save_latest(epoch)
             save_logs(
