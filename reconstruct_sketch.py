@@ -13,7 +13,7 @@ import open3d as o3d
 import imageio
 import numpy as np
 
-from pytorch3d.structures import Meshes
+from pytorch3d.structures import Meshes, join_meshes_as_batch
 from pytorch3d.renderer import (
     PerspectiveCameras,
     PointLights,
@@ -117,8 +117,12 @@ def main_function(experiment_directory, continue_from,  iterations, marching_cub
         mesh_filename = os.path.join(optimization_meshes_dir, out_name, "predicted.ply")
         lib.mesh.write_verts_faces_to_file(verts, faces, mesh_filename)
 
-        verts = torch.from_numpy(verts).type(torch.FloatTensor)
-        cd_dist = chamfer_distance(pointset.permute(0, 2, 1), verts[torch.randperm(len(verts))[:4096]].unsqueeze(0))[0]
+        verts = torch.from_numpy(np.array([verts])).type(torch.FloatTensor)
+        faces = torch.from_numpy(np.array([faces])).type(torch.FloatTensor)
+        out_mesh = Meshes(verts=verts, faces=faces)
+        # cd_dist = chamfer_distance(pointset.permute(0, 2, 1), verts[torch.randperm(len(verts))[:4096]].unsqueeze(0))[0]
+        pcs = sample_points_from_meshes(join_meshes_as_batch([out_mesh]), num_samples=4096)
+        cd_dist = chamfer_distance(pointset.permute(0, 2, 1), pcs)[0]
         print ('CD {}: {}'.format(out_name, cd_dist))
         all_cd_dist.append(cd_dist)
 
